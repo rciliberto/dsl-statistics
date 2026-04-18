@@ -6,17 +6,16 @@ import requests
 logger = logging.getLogger(__name__)
 
 STEAM_API_BASE = "https://api.steampowered.com"
-STEAM64_OFFSET = 76561198960185728
-STEAM64_MIN = 76561197960265728
+STEAM64_OFFSET = 76561197960265728
 
 
 def steam32_to_steam64(account_id: str) -> int:
     """Convert Steam32 account ID to Steam64.
 
-    If the ID is already 64-bit (>= minimum Steam64 value), return as-is.
+    If the ID is already 64-bit (>= offset), return as-is.
     """
     id_int = int(account_id)
-    if id_int >= STEAM64_MIN:
+    if id_int >= STEAM64_OFFSET:
         return id_int
     return id_int + STEAM64_OFFSET
 

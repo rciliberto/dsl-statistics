@@ -9,7 +9,8 @@ from dsl_statistics.scrapers.steam import (
 
 
 def test_steam32_to_steam64():
-    assert steam32_to_steam64("12345678") == 76561198972531406
+    # Steam64 = Steam32 + 76561197960265728
+    assert steam32_to_steam64("12345678") == 76561197972611406
 
 
 def test_steam32_to_steam64_already_64bit():
