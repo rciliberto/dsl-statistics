@@ -204,3 +204,76 @@ def mark_departed_members(
             [team_id] + current_player_ids,
         )
     conn.commit()
+
+
+def insert_player_stats(
+    conn: sqlite3.Connection,
+    player_id: int,
+    pp_score: float | None,
+    rank_number: int | None,
+    rank_subrank: int | None,
+) -> int:
+    """Insert a new stats snapshot. Returns stats id."""
+    cursor = conn.execute(
+        """INSERT INTO player_stats (player_id, pp_score, rank_number, rank_subrank, scraped_at)
+           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+        (player_id, pp_score, rank_number, rank_subrank),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def insert_player_heroes(
+    conn: sqlite3.Connection, stats_id: int, heroes: list[dict]
+) -> None:
+    """Insert hero stats for a given stats snapshot."""
+    for hero in heroes:
+        conn.execute(
+            """INSERT OR IGNORE INTO player_heroes
+               (stats_id, hero_name, matches_played, win_rate, is_most_played)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                stats_id,
+                hero["hero_name"],
+                hero.get("matches_played"),
+                hero.get("win_rate"),
+                hero.get("is_most_played", False),
+            ),
+        )
+    conn.commit()
+
+
+def insert_player_match(
+    conn: sqlite3.Connection, player_id: int, match_data: dict
+) -> bool:
+    """Insert a match record. Returns True if inserted, False if duplicate."""
+    try:
+        conn.execute(
+            """INSERT INTO player_matches
+               (player_id, match_id, hero_name, pp_before, pp_after, pp_change,
+                result, match_date, scraped_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (
+                player_id,
+                match_data["match_id"],
+                match_data.get("hero_name"),
+                match_data.get("pp_before"),
+                match_data.get("pp_after"),
+                match_data.get("pp_change"),
+                match_data.get("result"),
+                match_data.get("match_date"),
+            ),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def get_latest_stats_time(conn: sqlite3.Connection, player_id: int) -> str | None:
+    """Return the most recent scraped_at for a player, or None."""
+    row = conn.execute(
+        "SELECT MAX(scraped_at) FROM player_stats WHERE player_id = ?",
+        (player_id,),
+    ).fetchone()
+    return row[0] if row else None

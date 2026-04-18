@@ -10,6 +10,12 @@ from dsl_statistics.db import (
     upsert_team_member,
     mark_departed_members,
 )
+from dsl_statistics.db import (
+    insert_player_stats,
+    insert_player_heroes,
+    insert_player_match,
+    get_latest_stats_time,
+)
 
 
 @pytest.fixture
@@ -185,3 +191,95 @@ def test_upsert_team_member_reactivates(conn):
     assert row[0] is None
     assert row[1] == "substitute"
     assert row[2] == 1
+
+
+def test_insert_player_stats(conn):
+    conn.execute(
+        "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
+    )
+    stats_id = insert_player_stats(
+        conn, player_id=1, pp_score=1500.0, rank_number=9, rank_subrank=3
+    )
+    assert stats_id == 1
+    row = conn.execute(
+        "SELECT pp_score, rank_number FROM player_stats WHERE id = 1"
+    ).fetchone()
+    assert row[0] == 1500.0
+    assert row[1] == 9
+
+
+def test_insert_player_match_dedup(conn):
+    conn.execute(
+        "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
+    )
+    match_data = {
+        "match_id": "m1",
+        "hero_name": "Haze",
+        "pp_before": 1490.0,
+        "pp_after": 1500.0,
+        "pp_change": 10.0,
+        "result": "win",
+        "match_date": "2026-01-01",
+    }
+    inserted = insert_player_match(conn, player_id=1, match_data=match_data)
+    assert inserted is True
+    inserted2 = insert_player_match(conn, player_id=1, match_data=match_data)
+    assert inserted2 is False
+
+
+def test_get_latest_stats_time_none(conn):
+    conn.execute(
+        "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
+    )
+    assert get_latest_stats_time(conn, player_id=1) is None
+
+
+def test_get_latest_stats_time_returns_most_recent(conn):
+    conn.execute(
+        "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
+    )
+    conn.execute(
+        "INSERT INTO player_stats (player_id, pp_score, rank_number, rank_subrank, scraped_at) "
+        "VALUES (1, 1500, 9, 3, '2026-01-01 12:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO player_stats (player_id, pp_score, rank_number, rank_subrank, scraped_at) "
+        "VALUES (1, 1510, 9, 3, '2026-01-02 12:00:00')"
+    )
+    result = get_latest_stats_time(conn, player_id=1)
+    assert result == "2026-01-02 12:00:00"
+
+
+def test_insert_player_heroes(conn):
+    conn.execute(
+        "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
+    )
+    stats_id = insert_player_stats(
+        conn, player_id=1, pp_score=1500.0, rank_number=9, rank_subrank=3
+    )
+    heroes = [
+        {"hero_name": "Haze", "matches_played": 50, "win_rate": 0.62, "is_most_played": True},
+        {"hero_name": "Infernus", "matches_played": 30, "win_rate": 0.55, "is_most_played": False},
+    ]
+    insert_player_heroes(conn, stats_id, heroes)
+    rows = conn.execute(
+        "SELECT hero_name, matches_played FROM player_heroes WHERE stats_id = ?",
+        (stats_id,),
+    ).fetchall()
+    assert len(rows) == 2
+
+
+def test_insert_player_heroes_dedup(conn):
+    conn.execute(
+        "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
+    )
+    stats_id = insert_player_stats(
+        conn, player_id=1, pp_score=1500.0, rank_number=9, rank_subrank=3
+    )
+    heroes = [{"hero_name": "Haze", "matches_played": 50, "win_rate": 0.62}]
+    insert_player_heroes(conn, stats_id, heroes)
+    insert_player_heroes(conn, stats_id, heroes)
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM player_heroes WHERE stats_id = ?", (stats_id,)
+    ).fetchone()
+    assert rows[0] == 1
