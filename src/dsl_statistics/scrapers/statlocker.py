@@ -2,6 +2,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from playwright.sync_api import Page
 
@@ -48,15 +49,18 @@ def scrape_player_stats(
 ) -> StatlockerData:
     """Scrape a player's statlocker profile via network interception.
 
-    Navigates to the player's profile page and intercepts API responses
-    to extract PP score, rank, hero stats, and match history.
+    Intercepts these API endpoints:
+      - /api/info/heroes-full → hero ID-to-name mapping
+      - /api/profile/steam-profile/{id} → ppScore, estimatedRankNumber
+      - /api/profile/data/matches/{id}/concise?gameMode=1 → matchHistory, mostPlayedHeroes, storedPPScore
     """
     data = StatlockerData()
     api_responses: list[dict] = []
+    hero_id_map: dict[int, str] = {}
 
     def capture_response(response):
         url = response.url
-        if response.status == 200 and "api" in url.lower():
+        if response.status == 200 and "/api/" in url:
             try:
                 body = response.json()
                 api_responses.append({"url": url, "data": body})
@@ -72,16 +76,26 @@ def scrape_player_stats(
     try:
         page.goto(profile_url, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle", timeout=30_000)
-        time.sleep(1)  # Extra wait for delayed API calls
+        time.sleep(1)
     except Exception as e:
         logger.error(
             "Failed to load statlocker profile %s: %s", steam_account_id, e
         )
         return data
 
+    # First pass: build hero ID map from heroes-full
+    for resp in api_responses:
+        if "heroes-full" in resp["url"] and isinstance(resp["data"], list):
+            for hero in resp["data"]:
+                if "id" in hero and "name" in hero:
+                    hero_id_map[hero["id"]] = hero["name"]
+            logger.debug("Built hero map with %d heroes", len(hero_id_map))
+            break
+
+    # Second pass: parse profile and match data
     for resp in api_responses:
         try:
-            _parse_api_response(resp["url"], resp["data"], data)
+            _parse_api_response(resp["url"], resp["data"], data, hero_id_map, steam_account_id)
         except Exception as e:
             logger.warning("Failed to parse API response %s: %s", resp["url"], e)
 
@@ -99,137 +113,101 @@ def scrape_player_stats(
     return data
 
 
-def _parse_api_response(
-    url: str, body: dict | list, data: StatlockerData
-) -> None:
-    """Parse a captured API response and extract relevant data.
+def _decode_rank_number(estimated_rank: int) -> tuple[int, int]:
+    """Decode statlocker's estimatedRankNumber into (rank_number, subrank).
 
-    Field names cover common patterns — may need adjustment after inspecting
-    actual API responses. Run with --debug to log raw responses.
+    Format: tier * 10 + subrank, e.g. 103 = tier 10 (Ascendant), subrank 3.
     """
-    logger.debug("Parsing API response from: %s", url)
-    logger.debug(
-        "Response body (truncated): %s", json.dumps(body, default=str)[:500]
-    )
+    rank_number = estimated_rank // 10
+    rank_subrank = estimated_rank % 10
+    return rank_number, rank_subrank
 
+
+def _parse_api_response(
+    url: str, body: dict | list, data: StatlockerData,
+    hero_id_map: dict[int, str], steam_account_id: str,
+) -> None:
+    """Parse a captured API response from statlocker."""
     if not isinstance(body, dict):
         return
 
-    # Look for PP score
-    for key in ("pp", "pp_score", "performancePoints", "mmr", "rating"):
-        if key in body:
-            try:
-                data.pp_score = float(body[key])
-            except (ValueError, TypeError):
-                pass
+    # /api/profile/steam-profile/{id} — PP score and rank
+    if f"steam-profile/{steam_account_id}" in url:
+        if "ppScore" in body:
+            data.pp_score = float(body["ppScore"])
+        if "estimatedRankNumber" in body:
+            rank_num, subrank = _decode_rank_number(body["estimatedRankNumber"])
+            data.rank_number = rank_num
+            data.rank_subrank = subrank
+        return
 
-    # Look for rank info
-    for key in ("rank", "rankInfo", "rank_info"):
-        if key in body and isinstance(body[key], dict):
-            rank_data = body[key]
-            data.rank_number = rank_data.get(
-                "tier", rank_data.get("rank", rank_data.get("number"))
+    # /api/profile/data/matches/{id}/concise — match history and hero stats
+    if f"matches/{steam_account_id}/concise" in url:
+        # Prefer storedPPScore over steam-profile ppScore if available
+        if "storedPPScore" in body and body["storedPPScore"] is not None:
+            data.pp_score = float(body["storedPPScore"])
+
+        # Hero stats from profileAggregateStats.mostPlayedHeroes
+        agg = body.get("profileAggregateStats", {})
+        most_played = agg.get("mostPlayedHeroes", [])
+        if most_played and not data.heroes:
+            for i, hero in enumerate(most_played):
+                hero_id = hero.get("heroId")
+                hero_name = hero_id_map.get(hero_id, f"Hero {hero_id}")
+                matches_count = hero.get("matches", 0)
+                win_rate = hero.get("winRate", 0)
+                if isinstance(win_rate, (int, float)) and win_rate > 1:
+                    win_rate = win_rate / 100.0
+
+                data.heroes.append(
+                    HeroStats(
+                        hero_name=hero_name,
+                        matches_played=int(matches_count),
+                        win_rate=float(win_rate),
+                        is_most_played=i < 3,
+                    )
+                )
+
+        # Match history
+        match_history = body.get("matchHistory", [])
+        for match in match_history[:100]:
+            if not isinstance(match, dict):
+                continue
+            match_id = str(match.get("match_id", ""))
+            if not match_id:
+                continue
+
+            # Hero name from ID
+            hero_id = match.get("hero_id")
+            hero_name = hero_id_map.get(hero_id, f"Hero {hero_id}") if hero_id else None
+
+            # Result: match_result 1 = win, 0 = loss
+            match_result = match.get("match_result")
+            if match_result is not None:
+                result = "win" if match_result == 1 else "loss"
+            else:
+                result = None
+
+            # PP impact (change per match)
+            pp_change = match.get("ppImpact")
+
+            # Match date from start_time (milliseconds epoch)
+            start_time = match.get("start_time")
+            match_date = None
+            if start_time:
+                try:
+                    match_date = datetime.fromtimestamp(
+                        start_time / 1000, tz=timezone.utc
+                    ).isoformat()
+                except (ValueError, OSError):
+                    pass
+
+            data.matches.append(
+                MatchData(
+                    match_id=match_id,
+                    hero_name=hero_name,
+                    pp_change=float(pp_change) if pp_change is not None else None,
+                    result=result,
+                    match_date=match_date,
+                )
             )
-            data.rank_subrank = rank_data.get(
-                "subrank", rank_data.get("sub_rank", rank_data.get("division"))
-            )
-        elif key in body and isinstance(body[key], (int, float)):
-            data.rank_number = int(body[key])
-
-    # Look for first game date
-    for key in ("firstGame", "first_game", "firstGameAt", "first_match"):
-        if key in body:
-            data.first_game_at = str(body[key])
-
-    # Look for hero stats
-    for key in ("heroes", "heroStats", "hero_stats", "topHeroes"):
-        if key in body and isinstance(body[key], list):
-            _parse_heroes(body[key], data)
-
-    # Look for match history
-    for key in ("matches", "matchHistory", "match_history", "recentMatches", "games"):
-        if key in body and isinstance(body[key], list):
-            _parse_matches(body[key], data)
-
-
-def _parse_heroes(heroes_list: list, data: StatlockerData) -> None:
-    """Parse hero stats from API response."""
-    for i, hero in enumerate(heroes_list):
-        if not isinstance(hero, dict):
-            continue
-        name = hero.get("name", hero.get("hero_name", hero.get("heroName", "")))
-        if not name:
-            continue
-        matches = hero.get(
-            "matches", hero.get("matches_played", hero.get("games", 0))
-        )
-        wins = hero.get("wins", 0)
-        total = hero.get("matches", hero.get("games", matches))
-        win_rate = hero.get(
-            "win_rate",
-            hero.get("winRate", wins / total if total > 0 else 0),
-        )
-        if isinstance(win_rate, (int, float)) and win_rate > 1:
-            win_rate = win_rate / 100.0  # Convert percentage to decimal
-
-        data.heroes.append(
-            HeroStats(
-                hero_name=name,
-                matches_played=int(matches) if matches else 0,
-                win_rate=float(win_rate) if win_rate else 0.0,
-                is_most_played=i < 3,
-            )
-        )
-
-
-def _parse_matches(matches_list: list, data: StatlockerData) -> None:
-    """Parse match history from API response. Captures up to 100 matches."""
-    for match in matches_list[:100]:
-        if not isinstance(match, dict):
-            continue
-        match_id = str(
-            match.get("match_id", match.get("matchId", match.get("id", "")))
-        )
-        if not match_id:
-            continue
-
-        hero = match.get("hero", match.get("hero_name", match.get("heroName")))
-        result_raw = match.get("result", match.get("outcome", match.get("win")))
-        if isinstance(result_raw, bool):
-            result = "win" if result_raw else "loss"
-        elif isinstance(result_raw, str):
-            result = (
-                "win"
-                if result_raw.lower() in ("win", "won", "victory")
-                else "loss"
-            )
-        else:
-            result = None
-
-        pp_before = match.get("pp_before", match.get("ppBefore"))
-        pp_after = match.get("pp_after", match.get("ppAfter"))
-        pp_change = match.get(
-            "pp_change", match.get("ppChange", match.get("pp_delta"))
-        )
-
-        if pp_before is not None and pp_after is not None and pp_change is None:
-            pp_change = float(pp_after) - float(pp_before)
-
-        date = match.get(
-            "date",
-            match.get(
-                "match_date", match.get("played_at", match.get("timestamp"))
-            ),
-        )
-
-        data.matches.append(
-            MatchData(
-                match_id=match_id,
-                hero_name=hero,
-                pp_before=float(pp_before) if pp_before is not None else None,
-                pp_after=float(pp_after) if pp_after is not None else None,
-                pp_change=float(pp_change) if pp_change is not None else None,
-                result=result,
-                match_date=str(date) if date else None,
-            )
-        )
