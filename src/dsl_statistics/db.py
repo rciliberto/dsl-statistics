@@ -109,3 +109,98 @@ def get_connection(db_path: str = "dsl.db") -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def upsert_division(conn: sqlite3.Connection, name: str) -> int:
+    """Insert or get existing division. Returns division id."""
+    conn.execute("INSERT OR IGNORE INTO divisions (name) VALUES (?)", (name,))
+    row = conn.execute("SELECT id FROM divisions WHERE name = ?", (name,)).fetchone()
+    conn.commit()
+    return row[0]
+
+
+def upsert_team(conn: sqlite3.Connection, data: dict) -> int:
+    """Insert or update team by page_url. Returns team id."""
+    conn.execute(
+        """INSERT INTO teams (division_id, name, page_url, updated_at)
+           VALUES (:division_id, :name, :page_url, CURRENT_TIMESTAMP)
+           ON CONFLICT(page_url) DO UPDATE SET
+               name = excluded.name,
+               division_id = excluded.division_id,
+               updated_at = CURRENT_TIMESTAMP""",
+        data,
+    )
+    row = conn.execute(
+        "SELECT id FROM teams WHERE page_url = :page_url", data
+    ).fetchone()
+    conn.commit()
+    return row[0]
+
+
+def upsert_player(conn: sqlite3.Connection, data: dict) -> int:
+    """Insert or update player by steam_account_id. Returns player id."""
+    conn.execute(
+        """INSERT INTO players (display_name, discord_name, discord_id,
+               steam_profile_url, steam_account_id, statlocker_url)
+           VALUES (:display_name, :discord_name, :discord_id,
+               :steam_profile_url, :steam_account_id, :statlocker_url)
+           ON CONFLICT(steam_account_id) DO UPDATE SET
+               display_name = excluded.display_name,
+               discord_name = COALESCE(excluded.discord_name, players.discord_name),
+               discord_id = COALESCE(excluded.discord_id, players.discord_id),
+               steam_profile_url = COALESCE(excluded.steam_profile_url, players.steam_profile_url),
+               statlocker_url = COALESCE(excluded.statlocker_url, players.statlocker_url)""",
+        {
+            "display_name": data.get("display_name"),
+            "discord_name": data.get("discord_name"),
+            "discord_id": data.get("discord_id"),
+            "steam_profile_url": data.get("steam_profile_url"),
+            "steam_account_id": data.get("steam_account_id"),
+            "statlocker_url": data.get("statlocker_url"),
+        },
+    )
+    row = conn.execute(
+        "SELECT id FROM players WHERE steam_account_id = :steam_account_id", data
+    ).fetchone()
+    conn.commit()
+    return row[0]
+
+
+def upsert_team_member(
+    conn: sqlite3.Connection,
+    team_id: int,
+    player_id: int,
+    role: str,
+    is_poc: bool,
+) -> None:
+    """Insert or update team membership. Reactivates departed members."""
+    conn.execute(
+        """INSERT INTO team_members (team_id, player_id, role, is_poc, joined_at)
+           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(team_id, player_id) DO UPDATE SET
+               role = excluded.role,
+               is_poc = excluded.is_poc,
+               left_at = NULL""",
+        (team_id, player_id, role, is_poc),
+    )
+    conn.commit()
+
+
+def mark_departed_members(
+    conn: sqlite3.Connection, team_id: int, current_player_ids: list[int]
+) -> None:
+    """Set left_at for players no longer on the roster."""
+    if not current_player_ids:
+        conn.execute(
+            "UPDATE team_members SET left_at = CURRENT_TIMESTAMP "
+            "WHERE team_id = ? AND left_at IS NULL",
+            (team_id,),
+        )
+    else:
+        placeholders = ",".join("?" * len(current_player_ids))
+        conn.execute(
+            f"UPDATE team_members SET left_at = CURRENT_TIMESTAMP "
+            f"WHERE team_id = ? AND left_at IS NULL AND player_id NOT IN ({placeholders})",
+            [team_id] + current_player_ids,
+        )
+    conn.commit()
