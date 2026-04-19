@@ -16,6 +16,13 @@ RANK_NAMES = {
 }
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS heroes (
+    id INTEGER PRIMARY KEY,
+    class_name TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS divisions (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -286,3 +293,53 @@ def get_known_match_ids(conn: sqlite3.Connection, player_id: int) -> set[str]:
         (player_id,),
     ).fetchall()
     return {row[0] for row in rows}
+
+
+def upsert_heroes(conn: sqlite3.Connection, heroes: list[dict]) -> None:
+    """Insert or update hero ID → name mappings."""
+    for hero in heroes:
+        conn.execute(
+            """INSERT INTO heroes (id, class_name, name, updated_at)
+               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(id) DO UPDATE SET
+                   class_name = excluded.class_name,
+                   name = excluded.name,
+                   updated_at = CURRENT_TIMESTAMP""",
+            (hero["id"], hero["class_name"], hero["name"]),
+        )
+    conn.commit()
+
+
+def get_hero_id_map(conn: sqlite3.Connection) -> dict[int, str]:
+    """Return a mapping of hero ID → display name from the database."""
+    rows = conn.execute("SELECT id, name FROM heroes").fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def fix_hero_names(conn: sqlite3.Connection) -> int:
+    """Fix 'Hero N' entries in player_matches and player_heroes using the heroes table.
+
+    Returns the number of rows updated.
+    """
+    hero_map = get_hero_id_map(conn)
+    if not hero_map:
+        return 0
+
+    # Build reverse map: "Hero {id}" → display name
+    fix_map = {f"Hero {hid}": name for hid, name in hero_map.items()}
+
+    updated = 0
+    for old_name, new_name in fix_map.items():
+        cur = conn.execute(
+            "UPDATE player_matches SET hero_name = ? WHERE hero_name = ?",
+            (new_name, old_name),
+        )
+        updated += cur.rowcount
+        cur = conn.execute(
+            "UPDATE player_heroes SET hero_name = ? WHERE hero_name = ?",
+            (new_name, old_name),
+        )
+        updated += cur.rowcount
+
+    conn.commit()
+    return updated

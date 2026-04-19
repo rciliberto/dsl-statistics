@@ -13,7 +13,9 @@ from rich.logging import RichHandler
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
 from dsl_statistics.db import (
+    fix_hero_names,
     get_connection,
+    get_hero_id_map,
     get_known_match_ids,
     get_latest_stats_time,
     init_db,
@@ -22,12 +24,13 @@ from dsl_statistics.db import (
     insert_player_stats,
     mark_departed_members,
     upsert_division,
+    upsert_heroes,
     upsert_player,
     upsert_team,
     upsert_team_member,
 )
 from dsl_statistics.scrapers.auth import get_authenticated_context
-from dsl_statistics.scrapers.statlocker import scrape_player_stats
+from dsl_statistics.scrapers.statlocker import scrape_heroes_full, scrape_player_stats
 from dsl_statistics.scrapers.steam import fetch_steam_info
 from dsl_statistics.scrapers.tournament import scrape_team_page, scrape_teams_list
 
@@ -140,7 +143,7 @@ def scrape_tournament(page, conn, division_filter=None, team_filter=None):
     return scraped_players
 
 
-def scrape_statlocker_all(page, conn, players, force=False, refresh=False):
+def scrape_statlocker_all(page, conn, players, hero_id_map, force=False, refresh=False):
     """Scrape statlocker for all players."""
     logger = logging.getLogger("dsl.statlocker")
     stats_count = 0
@@ -173,7 +176,7 @@ def scrape_statlocker_all(page, conn, players, force=False, refresh=False):
             progress.update(task, player=p["display_name"])
             try:
                 known_ids = set() if force else get_known_match_ids(conn, p["player_id"])
-                data = scrape_player_stats(page, p["steam_account_id"], known_match_ids=known_ids)
+                data = scrape_player_stats(page, p["steam_account_id"], hero_id_map, known_match_ids=known_ids)
 
                 stats_id = insert_player_stats(
                     conn,
@@ -321,13 +324,26 @@ def main(division, team, refresh, force, debug, skip_statlocker, skip_steam, ref
 
             # Statlocker scrape (separate headless browser)
             if not skip_statlocker:
-                logger.info("Scraping statlocker profiles...")
                 browser = p.chromium.launch(headless=True)
                 sl_context = browser.new_context()
                 sl_page = sl_context.new_page()
 
+                # Fetch hero ID → name mapping (once per session)
+                hero_id_map = get_hero_id_map(conn)
+                if not hero_id_map:
+                    logger.info("Fetching hero definitions from statlocker...")
+                    heroes_raw = scrape_heroes_full(sl_page)
+                    if heroes_raw:
+                        upsert_heroes(conn, heroes_raw)
+                        hero_id_map = {h["id"]: h["name"] for h in heroes_raw}
+                        # Fix any existing "Hero N" entries from previous scrapes
+                        fixed = fix_hero_names(conn)
+                        if fixed:
+                            logger.info("Fixed %d hero name entries", fixed)
+
+                logger.info("Scraping statlocker profiles...")
                 stats_count, fail_count = scrape_statlocker_all(
-                    sl_page, conn, players, force=force, refresh=refresh
+                    sl_page, conn, players, hero_id_map, force=force, refresh=refresh
                 )
 
                 sl_page.close()

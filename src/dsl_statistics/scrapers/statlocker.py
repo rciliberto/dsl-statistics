@@ -44,21 +44,59 @@ class StatlockerData:
     matches: list[MatchData] = field(default_factory=list)
 
 
+def scrape_heroes_full(page: Page) -> list[dict]:
+    """Fetch the heroes-full mapping from statlocker.
+
+    Returns list of dicts with 'id', 'class_name', and 'name' fields.
+    Only needs to be called once per scrape session.
+    """
+    heroes_data: list[dict] = []
+
+    def capture(response):
+        if "heroes-full" in response.url and response.ok:
+            try:
+                heroes_data.append(response.json())
+            except Exception:
+                pass
+
+    page.on("response", capture)
+    page.goto(f"{STATLOCKER_BASE}/profile/0", wait_until="domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=30_000)
+    except Exception:
+        pass
+    page.remove_listener("response", capture)
+
+    if not heroes_data or not isinstance(heroes_data[0], list):
+        logger.warning("Failed to capture heroes-full data")
+        return []
+
+    result = []
+    for hero in heroes_data[0]:
+        if "id" in hero and "name" in hero:
+            result.append({
+                "id": hero["id"],
+                "class_name": hero.get("class_name", ""),
+                "name": hero["name"],
+            })
+    logger.info("Fetched %d heroes from statlocker", len(result))
+    return result
+
+
 def scrape_player_stats(
     page: Page,
     steam_account_id: str,
+    hero_id_map: dict[int, str],
     known_match_ids: set[str] | None = None,
 ) -> StatlockerData:
     """Scrape a player's statlocker profile via network interception.
 
     Intercepts these API endpoints:
-      - /api/info/heroes-full → hero ID-to-name mapping
       - /api/profile/steam-profile/{id} → ppScore, estimatedRankNumber
-      - /api/profile/data/matches/{id}/concise?gameMode=1 → matchHistory, mostPlayedHeroes, storedPPScore
+      - /api/profile/data/matches/{id}/concise?gameMode=1 → mostPlayedHeroes, storedPPScore
     """
     data = StatlockerData()
     api_responses: list[dict] = []
-    hero_id_map: dict[int, str] = {}
 
     def capture_response(response):
         url = response.url
@@ -80,15 +118,6 @@ def scrape_player_stats(
         # The data returned may be stale/cached (PP can show as 0).
         page.goto(profile_url, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle", timeout=30_000)
-
-        # Build hero ID map from the first load (heroes-full is static)
-        for resp in api_responses:
-            if "heroes-full" in resp["url"] and isinstance(resp["data"], list):
-                for hero in resp["data"]:
-                    if "id" in hero and "name" in hero:
-                        hero_id_map[hero["id"]] = hero["name"]
-                logger.debug("Built hero map with %d heroes", len(hero_id_map))
-                break
 
         # Wait for statlocker to recalculate PP, then reload for fresh data
         time.sleep(2)
