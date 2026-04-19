@@ -2,6 +2,9 @@ import os
 
 import psycopg
 import pytest
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from dsl_statistics.db import init_db
 from dsl_statistics.db import (
