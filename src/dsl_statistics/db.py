@@ -1,4 +1,7 @@
-import sqlite3
+import os
+
+import psycopg
+from psycopg import errors as pg_errors
 
 RANK_NAMES = {
     0: "Obscurus",
@@ -20,83 +23,83 @@ CREATE TABLE IF NOT EXISTS heroes (
     id INTEGER PRIMARY KEY,
     class_name TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS divisions (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS teams (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     division_id INTEGER NOT NULL REFERENCES divisions(id),
     name TEXT NOT NULL,
     page_url TEXT NOT NULL UNIQUE,
-    updated_at DATETIME,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS players (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     display_name TEXT NOT NULL,
     discord_name TEXT,
     discord_id TEXT,
     steam_profile_url TEXT,
     steam_account_id TEXT UNIQUE,
     statlocker_url TEXT,
-    first_game_at DATETIME,
-    steam_account_created DATETIME,
+    first_game_at TIMESTAMPTZ,
+    steam_account_created TIMESTAMPTZ,
     steam_games_owned INTEGER,
     steam_profile_visible BOOLEAN,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS team_members (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     team_id INTEGER NOT NULL REFERENCES teams(id),
     player_id INTEGER NOT NULL REFERENCES players(id),
     role TEXT NOT NULL CHECK(role IN ('core', 'substitute')),
-    is_poc BOOLEAN NOT NULL DEFAULT 0,
-    joined_at DATETIME NOT NULL,
-    left_at DATETIME,
+    is_poc BOOLEAN NOT NULL DEFAULT FALSE,
+    joined_at TIMESTAMPTZ NOT NULL,
+    left_at TIMESTAMPTZ,
     UNIQUE(team_id, player_id)
 );
 
 CREATE TABLE IF NOT EXISTS player_stats (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(id),
-    pp_score REAL,
+    pp_score DOUBLE PRECISION,
     rank_number INTEGER,
     rank_subrank INTEGER,
-    scraped_at DATETIME NOT NULL
+    scraped_at TIMESTAMPTZ NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_player_stats_player_scraped
     ON player_stats(player_id, scraped_at);
 
 CREATE TABLE IF NOT EXISTS player_heroes (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     stats_id INTEGER NOT NULL REFERENCES player_stats(id),
     hero_name TEXT NOT NULL,
     matches_played INTEGER,
-    win_rate REAL,
-    is_most_played BOOLEAN DEFAULT 0,
+    win_rate DOUBLE PRECISION,
+    is_most_played BOOLEAN DEFAULT FALSE,
     UNIQUE(stats_id, hero_name)
 );
 
 CREATE TABLE IF NOT EXISTS player_matches (
-    id INTEGER PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
     player_id INTEGER NOT NULL REFERENCES players(id),
     match_id TEXT NOT NULL,
     hero_name TEXT,
-    pp_before REAL,
-    pp_after REAL,
-    pp_change REAL,
+    pp_before DOUBLE PRECISION,
+    pp_after DOUBLE PRECISION,
+    pp_change DOUBLE PRECISION,
     result TEXT,
-    match_date DATETIME,
-    scraped_at DATETIME NOT NULL,
+    match_date TIMESTAMPTZ,
+    scraped_at TIMESTAMPTZ NOT NULL,
     UNIQUE(player_id, match_id)
 );
 
@@ -105,52 +108,54 @@ CREATE INDEX IF NOT EXISTS idx_player_matches_player_date
 """
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: psycopg.Connection) -> None:
     """Create all tables and indexes if they don't exist."""
-    conn.executescript(SCHEMA_SQL)
+    conn.execute(SCHEMA_SQL)
+    conn.commit()
 
 
-def get_connection(db_path: str = "dsl.db") -> sqlite3.Connection:
-    """Open a connection with FK enforcement and row factory."""
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.row_factory = sqlite3.Row
+def get_connection() -> psycopg.Connection:
+    """Open a connection using DATABASE_URL from the environment."""
+    url = os.environ["DATABASE_URL"]
+    conn = psycopg.connect(url)
     return conn
 
 
-def upsert_division(conn: sqlite3.Connection, name: str) -> int:
+def upsert_division(conn: psycopg.Connection, name: str) -> int:
     """Insert or get existing division. Returns division id."""
-    conn.execute("INSERT OR IGNORE INTO divisions (name) VALUES (?)", (name,))
-    row = conn.execute("SELECT id FROM divisions WHERE name = ?", (name,)).fetchone()
+    conn.execute(
+        "INSERT INTO divisions (name) VALUES (%s) ON CONFLICT DO NOTHING", (name,)
+    )
+    row = conn.execute("SELECT id FROM divisions WHERE name = %s", (name,)).fetchone()
     conn.commit()
     return row[0]
 
 
-def upsert_team(conn: sqlite3.Connection, data: dict) -> int:
+def upsert_team(conn: psycopg.Connection, data: dict) -> int:
     """Insert or update team by page_url. Returns team id."""
     conn.execute(
         """INSERT INTO teams (division_id, name, page_url, updated_at)
-           VALUES (:division_id, :name, :page_url, CURRENT_TIMESTAMP)
+           VALUES (%(division_id)s, %(name)s, %(page_url)s, NOW())
            ON CONFLICT(page_url) DO UPDATE SET
                name = excluded.name,
                division_id = excluded.division_id,
-               updated_at = CURRENT_TIMESTAMP""",
+               updated_at = NOW()""",
         data,
     )
     row = conn.execute(
-        "SELECT id FROM teams WHERE page_url = :page_url", data
+        "SELECT id FROM teams WHERE page_url = %(page_url)s", data
     ).fetchone()
     conn.commit()
     return row[0]
 
 
-def upsert_player(conn: sqlite3.Connection, data: dict) -> int:
+def upsert_player(conn: psycopg.Connection, data: dict) -> int:
     """Insert or update player by steam_account_id. Returns player id."""
     conn.execute(
         """INSERT INTO players (display_name, discord_name, discord_id,
                steam_profile_url, steam_account_id, statlocker_url)
-           VALUES (:display_name, :discord_name, :discord_id,
-               :steam_profile_url, :steam_account_id, :statlocker_url)
+           VALUES (%(display_name)s, %(discord_name)s, %(discord_id)s,
+               %(steam_profile_url)s, %(steam_account_id)s, %(statlocker_url)s)
            ON CONFLICT(steam_account_id) DO UPDATE SET
                display_name = excluded.display_name,
                discord_name = COALESCE(excluded.discord_name, players.discord_name),
@@ -167,14 +172,14 @@ def upsert_player(conn: sqlite3.Connection, data: dict) -> int:
         },
     )
     row = conn.execute(
-        "SELECT id FROM players WHERE steam_account_id = :steam_account_id", data
+        "SELECT id FROM players WHERE steam_account_id = %(steam_account_id)s", data
     ).fetchone()
     conn.commit()
     return row[0]
 
 
 def upsert_team_member(
-    conn: sqlite3.Connection,
+    conn: psycopg.Connection,
     team_id: int,
     player_id: int,
     role: str,
@@ -183,7 +188,7 @@ def upsert_team_member(
     """Insert or update team membership. Reactivates departed members."""
     conn.execute(
         """INSERT INTO team_members (team_id, player_id, role, is_poc, joined_at)
-           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+           VALUES (%s, %s, %s, %s, NOW())
            ON CONFLICT(team_id, player_id) DO UPDATE SET
                role = excluded.role,
                is_poc = excluded.is_poc,
@@ -194,51 +199,52 @@ def upsert_team_member(
 
 
 def mark_departed_members(
-    conn: sqlite3.Connection, team_id: int, current_player_ids: list[int]
+    conn: psycopg.Connection, team_id: int, current_player_ids: list[int]
 ) -> None:
     """Set left_at for players no longer on the roster."""
     if not current_player_ids:
         conn.execute(
-            "UPDATE team_members SET left_at = CURRENT_TIMESTAMP "
-            "WHERE team_id = ? AND left_at IS NULL",
+            "UPDATE team_members SET left_at = NOW() "
+            "WHERE team_id = %s AND left_at IS NULL",
             (team_id,),
         )
     else:
-        placeholders = ",".join("?" * len(current_player_ids))
+        placeholders = ",".join("%s" * len(current_player_ids))
         conn.execute(
-            f"UPDATE team_members SET left_at = CURRENT_TIMESTAMP "
-            f"WHERE team_id = ? AND left_at IS NULL AND player_id NOT IN ({placeholders})",
+            f"UPDATE team_members SET left_at = NOW() "
+            f"WHERE team_id = %s AND left_at IS NULL AND player_id NOT IN ({placeholders})",
             [team_id] + current_player_ids,
         )
     conn.commit()
 
 
 def insert_player_stats(
-    conn: sqlite3.Connection,
+    conn: psycopg.Connection,
     player_id: int,
     pp_score: float | None,
     rank_number: int | None,
     rank_subrank: int | None,
 ) -> int:
     """Insert a new stats snapshot. Returns stats id."""
-    cursor = conn.execute(
+    row = conn.execute(
         """INSERT INTO player_stats (player_id, pp_score, rank_number, rank_subrank, scraped_at)
-           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+           VALUES (%s, %s, %s, %s, NOW()) RETURNING id""",
         (player_id, pp_score, rank_number, rank_subrank),
-    )
+    ).fetchone()
     conn.commit()
-    return cursor.lastrowid
+    return row[0]
 
 
 def insert_player_heroes(
-    conn: sqlite3.Connection, stats_id: int, heroes: list[dict]
+    conn: psycopg.Connection, stats_id: int, heroes: list[dict]
 ) -> None:
     """Insert hero stats for a given stats snapshot."""
     for hero in heroes:
         conn.execute(
-            """INSERT OR IGNORE INTO player_heroes
+            """INSERT INTO player_heroes
                (stats_id, hero_name, matches_played, win_rate, is_most_played)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT DO NOTHING""",
             (
                 stats_id,
                 hero["hero_name"],
@@ -251,7 +257,7 @@ def insert_player_heroes(
 
 
 def insert_player_match(
-    conn: sqlite3.Connection, player_id: int, match_data: dict
+    conn: psycopg.Connection, player_id: int, match_data: dict
 ) -> bool:
     """Insert a match record. Returns True if inserted, False if duplicate."""
     try:
@@ -259,7 +265,7 @@ def insert_player_match(
             """INSERT INTO player_matches
                (player_id, match_id, hero_name, pp_before, pp_after, pp_change,
                 result, match_date, scraped_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
             (
                 player_id,
                 match_data["match_id"],
@@ -273,50 +279,51 @@ def insert_player_match(
         )
         conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except pg_errors.UniqueViolation:
+        conn.rollback()
         return False
 
 
-def get_latest_stats_time(conn: sqlite3.Connection, player_id: int) -> str | None:
+def get_latest_stats_time(conn: psycopg.Connection, player_id: int) -> str | None:
     """Return the most recent scraped_at for a player, or None."""
     row = conn.execute(
-        "SELECT MAX(scraped_at) FROM player_stats WHERE player_id = ?",
+        "SELECT MAX(scraped_at) FROM player_stats WHERE player_id = %s",
         (player_id,),
     ).fetchone()
-    return row[0] if row else None
+    return row[0].isoformat() if row and row[0] else None
 
 
-def get_known_match_ids(conn: sqlite3.Connection, player_id: int) -> set[str]:
+def get_known_match_ids(conn: psycopg.Connection, player_id: int) -> set[str]:
     """Return the set of match IDs already stored for a player."""
     rows = conn.execute(
-        "SELECT match_id FROM player_matches WHERE player_id = ?",
+        "SELECT match_id FROM player_matches WHERE player_id = %s",
         (player_id,),
     ).fetchall()
     return {row[0] for row in rows}
 
 
-def upsert_heroes(conn: sqlite3.Connection, heroes: list[dict]) -> None:
+def upsert_heroes(conn: psycopg.Connection, heroes: list[dict]) -> None:
     """Insert or update hero ID → name mappings."""
     for hero in heroes:
         conn.execute(
             """INSERT INTO heroes (id, class_name, name, updated_at)
-               VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+               VALUES (%s, %s, %s, NOW())
                ON CONFLICT(id) DO UPDATE SET
                    class_name = excluded.class_name,
                    name = excluded.name,
-                   updated_at = CURRENT_TIMESTAMP""",
+                   updated_at = NOW()""",
             (hero["id"], hero["class_name"], hero["name"]),
         )
     conn.commit()
 
 
-def get_hero_id_map(conn: sqlite3.Connection) -> dict[int, str]:
+def get_hero_id_map(conn: psycopg.Connection) -> dict[int, str]:
     """Return a mapping of hero ID → display name from the database."""
     rows = conn.execute("SELECT id, name FROM heroes").fetchall()
     return {row[0]: row[1] for row in rows}
 
 
-def fix_hero_names(conn: sqlite3.Connection) -> int:
+def fix_hero_names(conn: psycopg.Connection) -> int:
     """Fix 'Hero N' entries in player_matches and player_heroes using the heroes table.
 
     Returns the number of rows updated.
@@ -331,12 +338,12 @@ def fix_hero_names(conn: sqlite3.Connection) -> int:
     updated = 0
     for old_name, new_name in fix_map.items():
         cur = conn.execute(
-            "UPDATE player_matches SET hero_name = ? WHERE hero_name = ?",
+            "UPDATE player_matches SET hero_name = %s WHERE hero_name = %s",
             (new_name, old_name),
         )
         updated += cur.rowcount
         cur = conn.execute(
-            "UPDATE player_heroes SET hero_name = ? WHERE hero_name = ?",
+            "UPDATE player_heroes SET hero_name = %s WHERE hero_name = %s",
             (new_name, old_name),
         )
         updated += cur.rowcount

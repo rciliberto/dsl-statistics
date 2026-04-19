@@ -218,7 +218,7 @@ def scrape_statlocker_all(page, conn, players, hero_id_map, force=False, refresh
 
                 if data.first_game_at:
                     conn.execute(
-                        "UPDATE players SET first_game_at = ? WHERE id = ? AND first_game_at IS NULL",
+                        "UPDATE players SET first_game_at = %s WHERE id = %s AND first_game_at IS NULL",
                         (data.first_game_at, p["player_id"]),
                     )
                     conn.commit()
@@ -253,7 +253,7 @@ def scrape_steam_all(conn, players, refresh=False):
     for p in players:
         if not refresh:
             row = conn.execute(
-                "SELECT steam_profile_visible FROM players WHERE id = ?",
+                "SELECT steam_profile_visible FROM players WHERE id = %s",
                 (p["player_id"],),
             ).fetchone()
             if row and row[0] is not None:
@@ -263,10 +263,10 @@ def scrape_steam_all(conn, players, refresh=False):
             info = fetch_steam_info(api_key, p["steam_account_id"])
             conn.execute(
                 """UPDATE players SET
-                       steam_profile_visible = ?,
-                       steam_account_created = ?,
-                       steam_games_owned = ?
-                   WHERE id = ?""",
+                       steam_profile_visible = %s,
+                       steam_account_created = %s,
+                       steam_games_owned = %s
+                   WHERE id = %s""",
                 (
                     info["visible"],
                     info["account_created"],
