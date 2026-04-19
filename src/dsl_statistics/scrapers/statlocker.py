@@ -100,7 +100,10 @@ def scrape_player_stats(
         logger.error(
             "Failed to load statlocker profile %s: %s", steam_account_id, e
         )
+        page.remove_listener("response", capture_response)
         return data
+
+    page.remove_listener("response", capture_response)
 
     # Parse profile and hero data from the second (fresh) load
     for resp in api_responses:

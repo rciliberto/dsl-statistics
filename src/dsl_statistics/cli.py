@@ -142,77 +142,87 @@ def scrape_statlocker_all(page, conn, players, force=False, refresh=False):
     fail_count = 0
     skip_cache = force or refresh
 
+    # Pre-filter to players we'll actually scrape so the progress bar is accurate
+    to_scrape = []
     for p in players:
         if not p["statlocker_url"]:
             logger.warning("Player '%s' has no statlocker URL", p["display_name"])
             continue
-
         if not skip_cache and is_cache_fresh(conn, p["player_id"]):
             logger.debug("Skipping '%s' (cached)", p["display_name"])
             continue
+        to_scrape.append(p)
 
-        try:
-            known_ids = set() if force else get_known_match_ids(conn, p["player_id"])
-            data = scrape_player_stats(page, p["steam_account_id"], known_match_ids=known_ids)
+    with click.progressbar(
+        to_scrape,
+        label="Scraping statlocker",
+        item_show_func=lambda p: p["display_name"] if p else "",
+        show_eta=True,
+        show_pos=True,
+    ) as bar:
+        for p in bar:
+            try:
+                known_ids = set() if force else get_known_match_ids(conn, p["player_id"])
+                data = scrape_player_stats(page, p["steam_account_id"], known_match_ids=known_ids)
 
-            stats_id = insert_player_stats(
-                conn,
-                p["player_id"],
-                data.pp_score,
-                data.rank_number,
-                data.rank_subrank,
-            )
-
-            if data.heroes:
-                hero_dicts = [
-                    {
-                        "hero_name": h.hero_name,
-                        "matches_played": h.matches_played,
-                        "win_rate": h.win_rate,
-                        "is_most_played": h.is_most_played,
-                    }
-                    for h in data.heroes
-                ]
-                insert_player_heroes(conn, stats_id, hero_dicts)
-
-            new_matches = 0
-            for match in data.matches:
-                inserted = insert_player_match(
+                stats_id = insert_player_stats(
                     conn,
                     p["player_id"],
-                    {
-                        "match_id": match.match_id,
-                        "hero_name": match.hero_name,
-                        "pp_before": match.pp_before,
-                        "pp_after": match.pp_after,
-                        "pp_change": match.pp_change,
-                        "result": match.result,
-                        "match_date": match.match_date,
-                    },
+                    data.pp_score,
+                    data.rank_number,
+                    data.rank_subrank,
                 )
-                if inserted:
-                    new_matches += 1
 
-            if data.first_game_at:
-                conn.execute(
-                    "UPDATE players SET first_game_at = ? WHERE id = ? AND first_game_at IS NULL",
-                    (data.first_game_at, p["player_id"]),
+                if data.heroes:
+                    hero_dicts = [
+                        {
+                            "hero_name": h.hero_name,
+                            "matches_played": h.matches_played,
+                            "win_rate": h.win_rate,
+                            "is_most_played": h.is_most_played,
+                        }
+                        for h in data.heroes
+                    ]
+                    insert_player_heroes(conn, stats_id, hero_dicts)
+
+                new_matches = 0
+                for match in data.matches:
+                    inserted = insert_player_match(
+                        conn,
+                        p["player_id"],
+                        {
+                            "match_id": match.match_id,
+                            "hero_name": match.hero_name,
+                            "pp_before": match.pp_before,
+                            "pp_after": match.pp_after,
+                            "pp_change": match.pp_change,
+                            "result": match.result,
+                            "match_date": match.match_date,
+                        },
+                    )
+                    if inserted:
+                        new_matches += 1
+
+                if data.first_game_at:
+                    conn.execute(
+                        "UPDATE players SET first_game_at = ? WHERE id = ? AND first_game_at IS NULL",
+                        (data.first_game_at, p["player_id"]),
+                    )
+                    conn.commit()
+
+                stats_count += 1
+                logger.info(
+                    "Player '%s': PP=%.1f, %d heroes, %d new matches",
+                    p["display_name"],
+                    data.pp_score or 0,
+                    len(data.heroes),
+                    new_matches,
                 )
-                conn.commit()
-
-            stats_count += 1
-            logger.info(
-                "Player '%s': PP=%.1f, %d heroes, %d new matches",
-                p["display_name"],
-                data.pp_score or 0,
-                len(data.heroes),
-                new_matches,
-            )
-        except Exception as e:
-            fail_count += 1
-            logger.error(
-                "Failed to scrape statlocker for '%s': %s", p["display_name"], e
-            )
+            except Exception as e:
+                fail_count += 1
+                logger.error(
+                    "Failed to scrape statlocker for '%s': %s", p["display_name"], e
+                )
 
     return stats_count, fail_count
 
@@ -285,36 +295,41 @@ def main(division, team, refresh, force, debug, skip_statlocker, skip_steam, ref
     conn = get_connection()
     init_db(conn)
 
-    with sync_playwright() as p:
-        # Auth + Tournament scrape
-        context = get_authenticated_context(p)
-        page = context.new_page()
+    try:
+        with sync_playwright() as p:
+            # Auth + Tournament scrape
+            context = get_authenticated_context(p)
+            page = context.new_page()
 
-        logger.info("Scraping tournament site...")
-        players = scrape_tournament(page, conn, division, team)
-        logger.info("Found %d players from tournament site", len(players))
+            logger.info("Scraping tournament site...")
+            players = scrape_tournament(page, conn, division, team)
+            logger.info("Found %d players from tournament site", len(players))
 
-        page.close()
-        context.close()
+            page.close()
+            context.close()
 
-        # Statlocker scrape (separate headless browser)
-        if not skip_statlocker:
-            logger.info("Scraping statlocker profiles...")
-            browser = p.chromium.launch(headless=True)
-            sl_context = browser.new_context()
-            sl_page = sl_context.new_page()
+            # Statlocker scrape (separate headless browser)
+            if not skip_statlocker:
+                logger.info("Scraping statlocker profiles...")
+                browser = p.chromium.launch(headless=True)
+                sl_context = browser.new_context()
+                sl_page = sl_context.new_page()
 
-            stats_count, fail_count = scrape_statlocker_all(
-                sl_page, conn, players, force=force, refresh=refresh
-            )
+                stats_count, fail_count = scrape_statlocker_all(
+                    sl_page, conn, players, force=force, refresh=refresh
+                )
 
-            sl_page.close()
-            sl_context.close()
-            browser.close()
+                sl_page.close()
+                sl_context.close()
+                browser.close()
 
-            logger.info(
-                "Statlocker: %d scraped, %d failed", stats_count, fail_count
-            )
+                logger.info(
+                    "Statlocker: %d scraped, %d failed", stats_count, fail_count
+                )
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down cleanly")
+        conn.close()
+        return
 
     # Steam API (no browser needed)
     if not skip_steam:
