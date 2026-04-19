@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from playwright.sync_api import Page
 
@@ -11,8 +11,7 @@ logger = logging.getLogger(__name__)
 
 STATLOCKER_BASE = "https://statlocker.gg"
 RATE_LIMIT_SECONDS = 0
-MATCH_PAGE_SIZE = 50
-MATCH_LOOKBACK_DAYS = 90
+MATCH_PAGE_SIZE = 500
 
 
 @dataclass
@@ -144,6 +143,9 @@ def scrape_player_stats(
     # Paginate through match history via API to cover the full lookback window
     _fetch_all_matches(page, steam_account_id, data, hero_id_map, known_match_ids or set())
 
+    # Fetch all-time per-hero stats from the hero-performances endpoint
+    _fetch_hero_performances(page, steam_account_id, data, hero_id_map)
+
     logger.info(
         "Statlocker %s: PP=%.1f, rank=%s %s, %d heroes, %d matches",
         steam_account_id,
@@ -192,28 +194,58 @@ def _parse_api_response(
         if "storedPPScore" in body and body["storedPPScore"] is not None:
             data.pp_score = float(body["storedPPScore"])
 
-        # Hero stats from profileAggregateStats.mostPlayedHeroes
-        agg = body.get("profileAggregateStats") or {}
-        most_played = agg.get("mostPlayedHeroes", [])
-        if most_played and not data.heroes:
-            for i, hero in enumerate(most_played):
-                hero_id = hero.get("heroId")
-                hero_name = hero_id_map.get(hero_id, f"Hero {hero_id}")
-                matches_count = hero.get("matches", 0)
-                win_rate = hero.get("winRate", 0)
-                if isinstance(win_rate, (int, float)) and win_rate > 1:
-                    win_rate = win_rate / 100.0
+        # Hero stats are fetched from the hero-performances endpoint
 
-                data.heroes.append(
-                    HeroStats(
-                        hero_name=hero_name,
-                        matches_played=int(matches_count),
-                        win_rate=float(win_rate),
-                        is_most_played=i < 3,
-                    )
-                )
 
-        # Match history is fetched separately via pagination in _fetch_all_matches
+def _fetch_hero_performances(
+    page: Page,
+    steam_account_id: str,
+    data: StatlockerData,
+    hero_id_map: dict[int, str],
+) -> None:
+    """Fetch per-hero stats from the hero-performances endpoint."""
+    url = f"{STATLOCKER_BASE}/api/profile/hero-performances/{steam_account_id}"
+    try:
+        result = page.evaluate(
+            """async (url) => {
+                const resp = await fetch(url);
+                if (!resp.ok) return { ok: false, status: resp.status };
+                const data = await resp.json();
+                return { ok: true, data };
+            }""",
+            url,
+        )
+    except Exception as e:
+        logger.warning("Failed to fetch hero performances: %s", e)
+        return
+
+    if not result.get("ok"):
+        logger.warning("Hero performances API returned %s", result.get("status"))
+        return
+
+    perfs = result.get("data", {}).get("heroPerformances") or {}
+
+    heroes = []
+    for hero_id_str, perf in perfs.items():
+        hero_id = int(hero_id_str)
+        hero_name = hero_id_map.get(hero_id, f"Hero {hero_id}")
+        matches = perf.get("matches", 0)
+        wins = perf.get("wins", 0)
+        win_rate = wins / matches if matches > 0 else 0.0
+
+        heroes.append(
+            HeroStats(
+                hero_name=hero_name,
+                matches_played=matches,
+                win_rate=win_rate,
+            )
+        )
+
+    heroes.sort(key=lambda h: h.matches_played, reverse=True)
+    for i, hero in enumerate(heroes):
+        hero.is_most_played = i < 3
+
+    data.heroes = heroes
 
 
 def _fetch_all_matches(
@@ -223,13 +255,11 @@ def _fetch_all_matches(
     hero_id_map: dict[int, str],
     known_match_ids: set[str],
 ) -> None:
-    """Paginate through match history until we've covered at least MATCH_LOOKBACK_DAYS.
+    """Paginate through all match history.
 
-    All matches on every fetched page are kept (no hard date filter on individual
-    matches).  Pagination stops once we hit a match older than the lookback window,
-    a match already in the database, or there are no more results.
+    Pagination stops once we hit a match already in the database or there
+    are no more results.
     """
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=MATCH_LOOKBACK_DAYS)
     base_url = (
         f"{STATLOCKER_BASE}/api/profile/data/matches/"
         f"{steam_account_id}/concise?gameMode=1"
@@ -288,9 +318,6 @@ def _fetch_all_matches(
                 )
             except (ValueError, OSError):
                 continue
-
-            if match_date < cutoff:
-                stop_after_page = True
 
             seen_ids.add(match_id)
             new_in_page += 1
