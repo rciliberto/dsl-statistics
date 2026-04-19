@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 import click
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
 from dsl_statistics.db import (
     get_connection,
@@ -33,17 +36,25 @@ load_dotenv()
 CACHE_HOURS = 24
 
 
+console = Console(stderr=True)
+
+
 def setup_logging(debug: bool = False) -> None:
     level = logging.DEBUG if debug else logging.INFO
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    file_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     logging.basicConfig(
         level=level,
-        format=fmt,
+        format="%(message)s",
+        datefmt="[%X]",
         handlers=[
-            logging.StreamHandler(sys.stdout),
+            RichHandler(console=console, show_path=False, markup=False),
             logging.FileHandler("scrape.log", encoding="utf-8"),
         ],
     )
+    # File handler gets the detailed format
+    for h in logging.getLogger().handlers:
+        if isinstance(h, logging.FileHandler):
+            h.setFormatter(logging.Formatter(file_fmt))
 
 
 def is_cache_fresh(conn, player_id: int) -> bool:
@@ -125,12 +136,6 @@ def scrape_tournament(page, conn, division_filter=None, team_filter=None):
             )
 
         mark_departed_members(conn, team_id, current_player_ids)
-        logger.info(
-            "Team '%s' (%s): %d players",
-            team_data.name,
-            team_data.division,
-            len(current_player_ids),
-        )
 
     return scraped_players
 
@@ -153,14 +158,19 @@ def scrape_statlocker_all(page, conn, players, force=False, refresh=False):
             continue
         to_scrape.append(p)
 
-    with click.progressbar(
-        to_scrape,
-        label="Scraping statlocker",
-        item_show_func=lambda p: p["display_name"] if p else "",
-        show_eta=True,
-        show_pos=True,
-    ) as bar:
-        for p in bar:
+    progress = Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeRemainingColumn(),
+        TextColumn("{task.fields[player]}"),
+        console=console,
+    )
+
+    with progress:
+        task = progress.add_task("Scraping statlocker", total=len(to_scrape), player="")
+        for p in to_scrape:
+            progress.update(task, player=p["display_name"])
             try:
                 known_ids = set() if force else get_known_match_ids(conn, p["player_id"])
                 data = scrape_player_stats(page, p["steam_account_id"], known_match_ids=known_ids)
@@ -223,6 +233,7 @@ def scrape_statlocker_all(page, conn, players, force=False, refresh=False):
                 logger.error(
                     "Failed to scrape statlocker for '%s': %s", p["display_name"], e
                 )
+            progress.advance(task)
 
     return stats_count, fail_count
 
@@ -327,6 +338,8 @@ def main(division, team, refresh, force, debug, skip_statlocker, skip_steam, ref
                     "Statlocker: %d scraped, %d failed", stats_count, fail_count
                 )
     except KeyboardInterrupt:
+        # Suppress Playwright's async teardown errors
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
         logger.info("Interrupted — shutting down cleanly")
         conn.close()
         return

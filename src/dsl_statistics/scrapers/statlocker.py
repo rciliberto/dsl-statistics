@@ -164,7 +164,7 @@ def _parse_api_response(
             data.pp_score = float(body["storedPPScore"])
 
         # Hero stats from profileAggregateStats.mostPlayedHeroes
-        agg = body.get("profileAggregateStats", {})
+        agg = body.get("profileAggregateStats") or {}
         most_played = agg.get("mostPlayedHeroes", [])
         if most_played and not data.heroes:
             for i, hero in enumerate(most_played):
