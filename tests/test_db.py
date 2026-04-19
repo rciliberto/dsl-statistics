@@ -1,5 +1,6 @@
-import sqlite3
+import os
 
+import psycopg
 import pytest
 
 from dsl_statistics.db import init_db
@@ -20,21 +21,33 @@ from dsl_statistics.db import (
 
 @pytest.fixture
 def conn():
-    """In-memory SQLite database for testing."""
-    connection = sqlite3.connect(":memory:")
-    connection.execute("PRAGMA foreign_keys = ON")
+    """PostgreSQL test database — created fresh for each test."""
+    base_url = os.environ["DATABASE_URL"]
+    admin_url = base_url.rsplit("/", 1)[0] + "/dsl"
+    admin_conn = psycopg.connect(admin_url, autocommit=True)
+    admin_conn.execute("DROP DATABASE IF EXISTS dsl_test")
+    admin_conn.execute("CREATE DATABASE dsl_test")
+    admin_conn.close()
+
+    test_url = base_url.rsplit("/", 1)[0] + "/dsl_test"
+    connection = psycopg.connect(test_url)
     init_db(connection)
     yield connection
     connection.close()
 
+    admin_conn = psycopg.connect(admin_url, autocommit=True)
+    admin_conn.execute("DROP DATABASE IF EXISTS dsl_test")
+    admin_conn.close()
+
 
 def test_all_tables_exist(conn):
-    cursor = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-    )
-    tables = [row[0] for row in cursor.fetchall()]
+    rows = conn.execute(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+    ).fetchall()
+    tables = [row[0] for row in rows]
     expected = [
         "divisions",
+        "heroes",
         "player_heroes",
         "player_matches",
         "player_stats",
@@ -47,18 +60,22 @@ def test_all_tables_exist(conn):
 
 def test_division_name_unique(conn):
     conn.execute("INSERT INTO divisions (name) VALUES ('Division 1')")
-    with pytest.raises(sqlite3.IntegrityError):
+    conn.commit()
+    with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute("INSERT INTO divisions (name) VALUES ('Division 1')")
+    conn.rollback()
 
 
 def test_player_steam_id_unique(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '123')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    conn.commit()
+    with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute(
             "INSERT INTO players (display_name, steam_account_id) VALUES ('Bob', '123')"
         )
+    conn.rollback()
 
 
 def test_team_member_unique_constraint(conn):
@@ -71,13 +88,15 @@ def test_team_member_unique_constraint(conn):
     )
     conn.execute(
         "INSERT INTO team_members (team_id, player_id, role, is_poc, joined_at) "
-        "VALUES (1, 1, 'core', 0, '2026-01-01')"
+        "VALUES (1, 1, 'core', FALSE, '2026-01-01')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    conn.commit()
+    with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute(
             "INSERT INTO team_members (team_id, player_id, role, is_poc, joined_at) "
-            "VALUES (1, 1, 'substitute', 0, '2026-02-01')"
+            "VALUES (1, 1, 'substitute', FALSE, '2026-02-01')"
         )
+    conn.rollback()
 
 
 def test_player_match_unique_constraint(conn):
@@ -88,11 +107,13 @@ def test_player_match_unique_constraint(conn):
         "INSERT INTO player_matches (player_id, match_id, hero_name, result, match_date, scraped_at) "
         "VALUES (1, 'match_1', 'Haze', 'win', '2026-01-01', '2026-01-02')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    conn.commit()
+    with pytest.raises(psycopg.errors.UniqueViolation):
         conn.execute(
             "INSERT INTO player_matches (player_id, match_id, hero_name, result, match_date, scraped_at) "
             "VALUES (1, 'match_1', 'Haze', 'win', '2026-01-01', '2026-01-02')"
         )
+    conn.rollback()
 
 
 def test_team_member_role_check(conn):
@@ -103,17 +124,19 @@ def test_team_member_role_check(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '123')"
     )
-    with pytest.raises(sqlite3.IntegrityError):
+    conn.commit()
+    with pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(
             "INSERT INTO team_members (team_id, player_id, role, is_poc, joined_at) "
-            "VALUES (1, 1, 'invalid_role', 0, '2026-01-01')"
+            "VALUES (1, 1, 'invalid_role', FALSE, '2026-01-01')"
         )
+    conn.rollback()
 
 
 def test_upsert_division_creates(conn):
     div_id = upsert_division(conn, "Division 1")
     assert div_id == 1
-    row = conn.execute("SELECT name FROM divisions WHERE id = ?", (div_id,)).fetchone()
+    row = conn.execute("SELECT name FROM divisions WHERE id = %s", (div_id,)).fetchone()
     assert row[0] == "Division 1"
 
 
@@ -190,13 +213,14 @@ def test_upsert_team_member_reactivates(conn):
     ).fetchone()
     assert row[0] is None
     assert row[1] == "substitute"
-    assert row[2] == 1
+    assert row[2] is True
 
 
 def test_insert_player_stats(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
     )
+    conn.commit()
     stats_id = insert_player_stats(
         conn, player_id=1, pp_score=1500.0, rank_number=9, rank_subrank=3
     )
@@ -212,6 +236,7 @@ def test_insert_player_match_dedup(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
     )
+    conn.commit()
     match_data = {
         "match_id": "m1",
         "hero_name": "Haze",
@@ -231,6 +256,7 @@ def test_get_latest_stats_time_none(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
     )
+    conn.commit()
     assert get_latest_stats_time(conn, player_id=1) is None
 
 
@@ -246,14 +272,17 @@ def test_get_latest_stats_time_returns_most_recent(conn):
         "INSERT INTO player_stats (player_id, pp_score, rank_number, rank_subrank, scraped_at) "
         "VALUES (1, 1510, 9, 3, '2026-01-02 12:00:00')"
     )
+    conn.commit()
     result = get_latest_stats_time(conn, player_id=1)
-    assert result == "2026-01-02 12:00:00"
+    assert "2026-01-02" in result
+    assert "12:00:00" in result
 
 
 def test_insert_player_heroes(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
     )
+    conn.commit()
     stats_id = insert_player_stats(
         conn, player_id=1, pp_score=1500.0, rank_number=9, rank_subrank=3
     )
@@ -263,7 +292,7 @@ def test_insert_player_heroes(conn):
     ]
     insert_player_heroes(conn, stats_id, heroes)
     rows = conn.execute(
-        "SELECT hero_name, matches_played FROM player_heroes WHERE stats_id = ?",
+        "SELECT hero_name, matches_played FROM player_heroes WHERE stats_id = %s",
         (stats_id,),
     ).fetchall()
     assert len(rows) == 2
@@ -273,6 +302,7 @@ def test_insert_player_heroes_dedup(conn):
     conn.execute(
         "INSERT INTO players (display_name, steam_account_id) VALUES ('Alice', '1')"
     )
+    conn.commit()
     stats_id = insert_player_stats(
         conn, player_id=1, pp_score=1500.0, rank_number=9, rank_subrank=3
     )
@@ -280,6 +310,6 @@ def test_insert_player_heroes_dedup(conn):
     insert_player_heroes(conn, stats_id, heroes)
     insert_player_heroes(conn, stats_id, heroes)
     rows = conn.execute(
-        "SELECT COUNT(*) FROM player_heroes WHERE stats_id = ?", (stats_id,)
+        "SELECT COUNT(*) FROM player_heroes WHERE stats_id = %s", (stats_id,)
     ).fetchone()
     assert rows[0] == 1

@@ -209,7 +209,7 @@ def mark_departed_members(
             (team_id,),
         )
     else:
-        placeholders = ",".join("%s" * len(current_player_ids))
+        placeholders = ",".join(["%s"] * len(current_player_ids))
         conn.execute(
             f"UPDATE team_members SET left_at = NOW() "
             f"WHERE team_id = %s AND left_at IS NULL AND player_id NOT IN ({placeholders})",
