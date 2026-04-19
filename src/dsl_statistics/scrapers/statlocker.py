@@ -1,8 +1,7 @@
-import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from playwright.sync_api import Page
 
@@ -11,7 +10,9 @@ from dsl_statistics.db import RANK_NAMES
 logger = logging.getLogger(__name__)
 
 STATLOCKER_BASE = "https://statlocker.gg"
-RATE_LIMIT_SECONDS = 2
+RATE_LIMIT_SECONDS = 0
+MATCH_PAGE_SIZE = 50
+MATCH_LOOKBACK_DAYS = 90
 
 
 @dataclass
@@ -46,6 +47,7 @@ class StatlockerData:
 def scrape_player_stats(
     page: Page,
     steam_account_id: str,
+    known_match_ids: set[str] | None = None,
 ) -> StatlockerData:
     """Scrape a player's statlocker profile via network interception.
 
@@ -74,7 +76,24 @@ def scrape_player_stats(
     logger.info("Scraping statlocker profile: %s", profile_url)
 
     try:
+        # First load triggers statlocker to recalculate PP from matches.
+        # The data returned may be stale/cached (PP can show as 0).
         page.goto(profile_url, wait_until="domcontentloaded")
+        page.wait_for_load_state("networkidle", timeout=30_000)
+
+        # Build hero ID map from the first load (heroes-full is static)
+        for resp in api_responses:
+            if "heroes-full" in resp["url"] and isinstance(resp["data"], list):
+                for hero in resp["data"]:
+                    if "id" in hero and "name" in hero:
+                        hero_id_map[hero["id"]] = hero["name"]
+                logger.debug("Built hero map with %d heroes", len(hero_id_map))
+                break
+
+        # Wait for statlocker to recalculate PP, then reload for fresh data
+        time.sleep(2)
+        api_responses.clear()
+        page.reload(wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle", timeout=30_000)
         time.sleep(1)
     except Exception as e:
@@ -83,21 +102,15 @@ def scrape_player_stats(
         )
         return data
 
-    # First pass: build hero ID map from heroes-full
-    for resp in api_responses:
-        if "heroes-full" in resp["url"] and isinstance(resp["data"], list):
-            for hero in resp["data"]:
-                if "id" in hero and "name" in hero:
-                    hero_id_map[hero["id"]] = hero["name"]
-            logger.debug("Built hero map with %d heroes", len(hero_id_map))
-            break
-
-    # Second pass: parse profile and match data
+    # Parse profile and hero data from the second (fresh) load
     for resp in api_responses:
         try:
             _parse_api_response(resp["url"], resp["data"], data, hero_id_map, steam_account_id)
         except Exception as e:
             logger.warning("Failed to parse API response %s: %s", resp["url"], e)
+
+    # Paginate through match history via API to cover the full lookback window
+    _fetch_all_matches(page, steam_account_id, data, hero_id_map, known_match_ids or set())
 
     logger.info(
         "Statlocker %s: PP=%.1f, rank=%s %s, %d heroes, %d matches",
@@ -168,46 +181,118 @@ def _parse_api_response(
                     )
                 )
 
-        # Match history
-        match_history = body.get("matchHistory", [])
-        for match in match_history[:100]:
+        # Match history is fetched separately via pagination in _fetch_all_matches
+
+
+def _fetch_all_matches(
+    page: Page,
+    steam_account_id: str,
+    data: StatlockerData,
+    hero_id_map: dict[int, str],
+    known_match_ids: set[str],
+) -> None:
+    """Paginate through match history until we've covered at least MATCH_LOOKBACK_DAYS.
+
+    All matches on every fetched page are kept (no hard date filter on individual
+    matches).  Pagination stops once we hit a match older than the lookback window,
+    a match already in the database, or there are no more results.
+    """
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=MATCH_LOOKBACK_DAYS)
+    base_url = (
+        f"{STATLOCKER_BASE}/api/profile/data/matches/"
+        f"{steam_account_id}/concise?gameMode=1"
+    )
+    offset = 0
+    seen_ids: set[str] = set()
+
+    while True:
+        url = f"{base_url}&offset={offset}&limit={MATCH_PAGE_SIZE}"
+        try:
+            result = page.evaluate(
+                """async (url) => {
+                    const resp = await fetch(url);
+                    if (!resp.ok) return { ok: false, status: resp.status };
+                    const data = await resp.json();
+                    return { ok: true, matches: data.matchHistory || [] };
+                }""",
+                url,
+            )
+        except Exception as e:
+            logger.warning("Failed to fetch matches at offset %d: %s", offset, e)
+            break
+
+        if not result.get("ok"):
+            logger.warning(
+                "Match API returned %s at offset %d",
+                result.get("status"),
+                offset,
+            )
+            break
+
+        matches = result.get("matches", [])
+        if not matches:
+            break
+
+        stop_after_page = False
+        new_in_page = 0
+        for match in matches:
             if not isinstance(match, dict):
                 continue
             match_id = str(match.get("match_id", ""))
-            if not match_id:
+            if not match_id or match_id in seen_ids:
                 continue
 
-            # Hero name from ID
-            hero_id = match.get("hero_id")
-            hero_name = hero_id_map.get(hero_id, f"Hero {hero_id}") if hero_id else None
+            # Stop paginating if we've reached a match we already have
+            if match_id in known_match_ids:
+                stop_after_page = True
+                continue
 
-            # Result: match_result 1 = win, 0 = loss
-            match_result = match.get("match_result")
-            if match_result is not None:
-                result = "win" if match_result == 1 else "loss"
-            else:
-                result = None
-
-            # PP impact (change per match)
-            pp_change = match.get("ppImpact")
-
-            # Match date from start_time (milliseconds epoch)
             start_time = match.get("start_time")
-            match_date = None
-            if start_time:
-                try:
-                    match_date = datetime.fromtimestamp(
-                        start_time / 1000, tz=timezone.utc
-                    ).isoformat()
-                except (ValueError, OSError):
-                    pass
+            if not start_time:
+                continue
+            try:
+                match_date = datetime.fromtimestamp(
+                    start_time / 1000, tz=timezone.utc
+                )
+            except (ValueError, OSError):
+                continue
+
+            if match_date < cutoff:
+                stop_after_page = True
+
+            seen_ids.add(match_id)
+            new_in_page += 1
+
+            hero_id = match.get("hero_id")
+            hero_name = (
+                hero_id_map.get(hero_id, f"Hero {hero_id}") if hero_id else None
+            )
+
+            match_result = match.get("match_result")
+            result_str = None
+            if match_result is not None:
+                result_str = "win" if match_result == 1 else "loss"
+
+            pp_change = match.get("ppImpact")
 
             data.matches.append(
                 MatchData(
                     match_id=match_id,
                     hero_name=hero_name,
                     pp_change=float(pp_change) if pp_change is not None else None,
-                    result=result,
-                    match_date=match_date,
+                    result=result_str,
+                    match_date=match_date.isoformat(),
                 )
             )
+
+        logger.debug(
+            "Fetched offset=%d: %d matches, %d new",
+            offset,
+            len(matches),
+            new_in_page,
+        )
+
+        if stop_after_page or new_in_page == 0:
+            break
+
+        offset += MATCH_PAGE_SIZE

@@ -11,6 +11,7 @@ from playwright.sync_api import sync_playwright
 
 from dsl_statistics.db import (
     get_connection,
+    get_known_match_ids,
     get_latest_stats_time,
     init_db,
     insert_player_heroes,
@@ -134,23 +135,25 @@ def scrape_tournament(page, conn, division_filter=None, team_filter=None):
     return scraped_players
 
 
-def scrape_statlocker_all(page, conn, players, force=False):
+def scrape_statlocker_all(page, conn, players, force=False, refresh=False):
     """Scrape statlocker for all players."""
     logger = logging.getLogger("dsl.statlocker")
     stats_count = 0
     fail_count = 0
+    skip_cache = force or refresh
 
     for p in players:
         if not p["statlocker_url"]:
             logger.warning("Player '%s' has no statlocker URL", p["display_name"])
             continue
 
-        if not force and is_cache_fresh(conn, p["player_id"]):
+        if not skip_cache and is_cache_fresh(conn, p["player_id"]):
             logger.debug("Skipping '%s' (cached)", p["display_name"])
             continue
 
         try:
-            data = scrape_player_stats(page, p["steam_account_id"])
+            known_ids = set() if force else get_known_match_ids(conn, p["player_id"])
+            data = scrape_player_stats(page, p["steam_account_id"], known_match_ids=known_ids)
 
             stats_id = insert_player_stats(
                 conn,
@@ -266,14 +269,15 @@ def scrape_steam_all(conn, players, refresh=False):
 @click.command()
 @click.option("--division", default=None, help="Scrape only this division")
 @click.option("--team", default=None, help="Scrape only this team")
-@click.option("--force", is_flag=True, help="Ignore 24h cache")
+@click.option("--refresh", is_flag=True, help="Bypass 24h cache but stop on known matches")
+@click.option("--force", is_flag=True, help="Bypass 24h cache and re-pull all matches")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
 @click.option("--skip-statlocker", is_flag=True, help="Skip statlocker scrape")
 @click.option("--skip-steam", is_flag=True, help="Skip Steam API calls")
 @click.option(
     "--refresh-steam", is_flag=True, help="Re-fetch Steam data for all players"
 )
-def main(division, team, force, debug, skip_statlocker, skip_steam, refresh_steam):
+def main(division, team, refresh, force, debug, skip_statlocker, skip_steam, refresh_steam):
     """DSL Tournament Scraper — collect player data from tournament site, statlocker, and Steam."""
     setup_logging(debug=debug)
     logger = logging.getLogger("dsl")
@@ -301,7 +305,7 @@ def main(division, team, force, debug, skip_statlocker, skip_steam, refresh_stea
             sl_page = sl_context.new_page()
 
             stats_count, fail_count = scrape_statlocker_all(
-                sl_page, conn, players, force=force
+                sl_page, conn, players, force=force, refresh=refresh
             )
 
             sl_page.close()

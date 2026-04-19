@@ -277,3 +277,12 @@ def get_latest_stats_time(conn: sqlite3.Connection, player_id: int) -> str | Non
         (player_id,),
     ).fetchone()
     return row[0] if row else None
+
+
+def get_known_match_ids(conn: sqlite3.Connection, player_id: int) -> set[str]:
+    """Return the set of match IDs already stored for a player."""
+    rows = conn.execute(
+        "SELECT match_id FROM player_matches WHERE player_id = ?",
+        (player_id,),
+    ).fetchall()
+    return {row[0] for row in rows}
