@@ -20,6 +20,7 @@ from dsl_statistics.db import (
     insert_player_match,
     get_latest_stats_time,
 )
+from dsl_statistics.db import get_prior_player_data
 
 
 @pytest.fixture
@@ -316,3 +317,41 @@ def test_insert_player_heroes_dedup(conn):
         "SELECT COUNT(*) FROM player_heroes WHERE stats_id = %s", (stats_id,)
     ).fetchone()
     assert rows[0] == 1
+
+
+def test_get_prior_player_data_no_data(conn):
+    """Returns None when player has no stats or matches."""
+    pid = upsert_player(conn, {
+        "display_name": "New Player",
+        "steam_account_id": "111",
+    })
+    result = get_prior_player_data(conn, pid)
+    assert result is None
+
+
+def test_get_prior_player_data_with_data(conn):
+    """Returns known match IDs and latest PP when player has history."""
+    pid = upsert_player(conn, {
+        "display_name": "Veteran",
+        "steam_account_id": "222",
+    })
+    insert_player_stats(conn, pid, 1500.0, 8, 2)
+    insert_player_stats(conn, pid, 1600.0, 8, 3)
+    insert_player_match(conn, pid, {
+        "match_id": "m1",
+        "hero_name": "Abrams",
+        "pp_change": 10.0,
+        "result": "win",
+        "match_date": "2026-04-20T12:00:00+00:00",
+    })
+    insert_player_match(conn, pid, {
+        "match_id": "m2",
+        "hero_name": "Haze",
+        "pp_change": -5.0,
+        "result": "loss",
+        "match_date": "2026-04-20T13:00:00+00:00",
+    })
+    result = get_prior_player_data(conn, pid)
+    assert result is not None
+    assert result["pp_score"] == 1600.0
+    assert result["known_match_ids"] == {"m1", "m2"}

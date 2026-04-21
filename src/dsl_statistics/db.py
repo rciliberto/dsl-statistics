@@ -302,6 +302,26 @@ def get_known_match_ids(conn: psycopg.Connection, player_id: int) -> set[str]:
     return {row[0] for row in rows}
 
 
+def get_prior_player_data(conn: psycopg.Connection, player_id: int) -> dict | None:
+    """Return prior scrape data for a player, or None if never scraped.
+
+    Returns dict with 'pp_score' (float|None) and 'known_match_ids' (set[str]).
+    """
+    match_rows = conn.execute(
+        "SELECT match_id FROM player_matches WHERE player_id = %s",
+        (player_id,),
+    ).fetchall()
+    known_ids = {row[0] for row in match_rows}
+    if not known_ids:
+        return None
+    pp_row = conn.execute(
+        "SELECT pp_score FROM player_stats WHERE player_id = %s ORDER BY scraped_at DESC LIMIT 1",
+        (player_id,),
+    ).fetchone()
+    pp_score = pp_row[0] if pp_row else None
+    return {"pp_score": pp_score, "known_match_ids": known_ids}
+
+
 def upsert_heroes(conn: psycopg.Connection, heroes: list[dict]) -> None:
     """Insert or update hero ID → name mappings."""
     for hero in heroes:
