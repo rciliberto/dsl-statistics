@@ -16,7 +16,6 @@ from dsl_statistics.db import (
     fix_hero_names,
     get_connection,
     get_hero_id_map,
-    get_known_match_ids,
     get_latest_stats_time,
     get_prior_player_data,
     init_db,

@@ -293,15 +293,6 @@ def get_latest_stats_time(conn: psycopg.Connection, player_id: int) -> str | Non
     return row[0].isoformat() if row and row[0] else None
 
 
-def get_known_match_ids(conn: psycopg.Connection, player_id: int) -> set[str]:
-    """Return the set of match IDs already stored for a player."""
-    rows = conn.execute(
-        "SELECT match_id FROM player_matches WHERE player_id = %s",
-        (player_id,),
-    ).fetchall()
-    return {row[0] for row in rows}
-
-
 def get_prior_player_data(conn: psycopg.Connection, player_id: int) -> dict | None:
     """Return prior scrape data for a player, or None if never scraped.
 
