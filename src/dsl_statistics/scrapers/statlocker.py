@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 STATLOCKER_BASE = "https://statlocker.gg"
 RATE_LIMIT_SECONDS = 0
-MATCH_PAGE_SIZE = 500
+MATCH_PAGE_SIZE_FULL = 500
+MATCH_PAGE_SIZE_INCREMENTAL = 50
 
 
 @dataclass
@@ -41,6 +42,12 @@ class StatlockerData:
     first_game_at: str | None = None
     heroes: list[HeroStats] = field(default_factory=list)
     matches: list[MatchData] = field(default_factory=list)
+
+
+@dataclass
+class PriorPlayerData:
+    known_match_ids: set[str]
+    pp_score: float | None = None
 
 
 def scrape_heroes_full(page: Page) -> list[dict]:
@@ -86,13 +93,13 @@ def scrape_player_stats(
     page: Page,
     steam_account_id: str,
     hero_id_map: dict[int, str],
-    known_match_ids: set[str] | None = None,
+    prior: PriorPlayerData | None = None,
 ) -> StatlockerData:
     """Scrape a player's statlocker profile via network interception.
 
-    Intercepts these API endpoints:
-      - /api/profile/steam-profile/{id} → ppScore, estimatedRankNumber
-      - /api/profile/data/matches/{id}/concise?gameMode=1 → mostPlayedHeroes, storedPPScore
+    If prior is None (new player or --force), does a double-load to get
+    accurate PP and uses a large match page size. If prior is provided
+    (incremental daily run), does a single load and uses a small page size.
     """
     data = StatlockerData()
     api_responses: list[dict] = []
@@ -113,17 +120,16 @@ def scrape_player_stats(
     logger.info("Scraping statlocker profile: %s", profile_url)
 
     try:
-        # First load triggers statlocker to recalculate PP from matches.
-        # The data returned may be stale/cached (PP can show as 0).
         page.goto(profile_url, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle", timeout=30_000)
 
-        # Wait for statlocker to recalculate PP, then reload for fresh data
-        time.sleep(2)
-        api_responses.clear()
-        page.reload(wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle", timeout=30_000)
-        time.sleep(1)
+        if prior is None:
+            # Full scrape: double-load for accurate PP recalculation
+            time.sleep(2)
+            api_responses.clear()
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_load_state("networkidle", timeout=30_000)
+            time.sleep(1)
     except Exception as e:
         logger.error(
             "Failed to load statlocker profile %s: %s", steam_account_id, e
@@ -133,17 +139,21 @@ def scrape_player_stats(
 
     page.remove_listener("response", capture_response)
 
-    # Parse profile and hero data from the second (fresh) load
     for resp in api_responses:
         try:
             _parse_api_response(resp["url"], resp["data"], data, hero_id_map, steam_account_id)
         except Exception as e:
             logger.warning("Failed to parse API response %s: %s", resp["url"], e)
 
-    # Paginate through match history via API to cover the full lookback window
-    _fetch_all_matches(page, steam_account_id, data, hero_id_map, known_match_ids or set())
+    if prior is None:
+        known_ids: set[str] = set()
+        page_size = MATCH_PAGE_SIZE_FULL
+    else:
+        known_ids = prior.known_match_ids
+        page_size = MATCH_PAGE_SIZE_INCREMENTAL
 
-    # Fetch all-time per-hero stats from the hero-performances endpoint
+    _fetch_all_matches(page, steam_account_id, data, hero_id_map, known_ids, page_size)
+
     _fetch_hero_performances(page, steam_account_id, data, hero_id_map)
 
     logger.info(
@@ -254,6 +264,7 @@ def _fetch_all_matches(
     data: StatlockerData,
     hero_id_map: dict[int, str],
     known_match_ids: set[str],
+    page_size: int,
 ) -> None:
     """Paginate through all match history.
 
@@ -268,7 +279,7 @@ def _fetch_all_matches(
     seen_ids: set[str] = set()
 
     while True:
-        url = f"{base_url}&offset={offset}&limit={MATCH_PAGE_SIZE}"
+        url = f"{base_url}&offset={offset}&limit={page_size}"
         try:
             result = page.evaluate(
                 """async (url) => {
@@ -354,4 +365,4 @@ def _fetch_all_matches(
         if stop_after_page or new_in_page == 0:
             break
 
-        offset += MATCH_PAGE_SIZE
+        offset += page_size
