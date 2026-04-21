@@ -18,6 +18,7 @@ from dsl_statistics.db import (
     get_hero_id_map,
     get_known_match_ids,
     get_latest_stats_time,
+    get_prior_player_data,
     init_db,
     insert_player_heroes,
     insert_player_match,
@@ -30,7 +31,7 @@ from dsl_statistics.db import (
     upsert_team_member,
 )
 from dsl_statistics.scrapers.auth import get_authenticated_context
-from dsl_statistics.scrapers.statlocker import scrape_heroes_full, scrape_player_stats
+from dsl_statistics.scrapers.statlocker import PriorPlayerData, scrape_heroes_full, scrape_player_stats
 from dsl_statistics.scrapers.steam import fetch_steam_info
 from dsl_statistics.scrapers.tournament import scrape_team_page, scrape_teams_list
 
@@ -175,8 +176,15 @@ def scrape_statlocker_all(page, conn, players, hero_id_map, force=False, refresh
         for p in to_scrape:
             progress.update(task, player=p["display_name"])
             try:
-                known_ids = set() if force else get_known_match_ids(conn, p["player_id"])
-                data = scrape_player_stats(page, p["steam_account_id"], hero_id_map, known_match_ids=known_ids)
+                if force:
+                    prior = None
+                else:
+                    prior_data = get_prior_player_data(conn, p["player_id"])
+                    prior = PriorPlayerData(
+                        known_match_ids=prior_data["known_match_ids"],
+                        pp_score=prior_data["pp_score"],
+                    ) if prior_data else None
+                data = scrape_player_stats(page, p["steam_account_id"], hero_id_map, prior=prior)
 
                 stats_id = insert_player_stats(
                     conn,
